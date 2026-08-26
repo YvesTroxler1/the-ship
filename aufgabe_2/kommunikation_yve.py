@@ -20,14 +20,14 @@ from flask import Flask, request, jsonify
 # ---- Konfiguration: HIER pro VM anpassen ----------------------------------
 
 # Welche Station bedient DIESE VM?
-STATION_NAME = "Elyse Terminal"          # oder "Shangris Station"
-STATION_COORDS = {"x": -70565, "y": 72811}  # bzw. {"x": 4446, "y": 4340}
+STATION_NAME = "Shangris Station"          # oder "Shangris Station"
+STATION_COORDS = {"x": 4446, "y": 4340}  # bzw. {"x": 4446, "y": 4340}
 
-COMM_WS_URL = "ws://192.168.101.21:2025/ws"  # ggf. Station-spezifischer Endpunkt
-TARGET_SET_URL = "http://192.168.101.21:2009/set_target"
+COMM_WS_URL = "ws://192.168.101.20:2025/ws"  # ggf. Station-spezifischer Endpunkt
+TARGET_SET_URL = "http://192.168.101.20:2009/set_target"
 
 EIGENER_PORT = 5001                       # >= 5000, wie gefordert
-PARTNER_URL = "http://192.168.101.22:5001/relay"  # IP/Port der Partner-VM
+PARTNER_URL = "http://192.168.101.21:5001/relay"  # IP/Port der Partner-VM
 
 HEARTBEAT_SEKUNDEN = 3   # "mindestens alle 3s eine Nachricht"
 
