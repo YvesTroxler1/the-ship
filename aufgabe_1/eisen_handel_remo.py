@@ -7,7 +7,7 @@ import requests
 
 BASE = "http://192.168.101.21"
 
-AZURA = "Azura Station"
+AZURA = "gugus station"
 CORE = "Core Station"
 VESTA = "Vesta Station"
 VESTA_COORDS = {"x": 7000, "y": 7000}
@@ -28,7 +28,7 @@ def fliege_zu(station, koordinaten=None):
 
 def handel(aktion, station, menge):
     """Kaufen oder verkaufen. Versucht es notfalls 3x, falls der Server kurz ablehnt."""
-    time.sleep(5)  # kleine Pause vor dem Request
+    time.sleep(5)
     for versuch in range(3):
         antwort = requests.post(
             f"{BASE}:2011/{aktion}",

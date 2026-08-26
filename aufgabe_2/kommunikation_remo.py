@@ -20,16 +20,20 @@ from flask import Flask, request, jsonify
 # ---- Konfiguration: HIER pro VM anpassen ----------------------------------
 
 # Welche Station bedient DIESE VM?
-STATION_NAME = "Elyse Terminal"          # oder "Shangris Station"
+STATION_NAME = "Elyse Terminal"             # oder "Shangris Station"
 STATION_COORDS = {"x": -70565, "y": 72811}  # bzw. {"x": 4446, "y": 4340}
 
-COMM_WS_URL = "ws://192.168.101.21:2025/ws"  # ggf. Station-spezifischer Endpunkt
+# WICHTIG: Port unbedingt mit der Aufgabenstellung/Partner abgleichen!
+# In der Angabe stehen zwei unterschiedliche Ports (2024 im Text, 2025 im example.js) -
+# klären, welcher Port wirklich zu Elyse Terminal gehört.
+COMM_WS_URL = "ws://192.168.101.21:2025/ws"   # ggf. Station-spezifischer Endpunkt
 TARGET_SET_URL = "http://192.168.101.21:2009/set_target"
 
-EIGENER_PORT = 5001                       # >= 5000, wie gefordert
-PARTNER_URL = "http://192.168.101.22:5001/relay"  # IP/Port der Partner-VM
+EIGENER_PORT = 5001                                # >= 5000, wie gefordert
+PARTNER_URL = "http://192.168.101.20:5001/relay"   # IP/Port der Partner-VM
 
 HEARTBEAT_SEKUNDEN = 3   # "mindestens alle 3s eine Nachricht"
+RECONNECT_SEKUNDEN = 3
 
 # ---- Queues -----------------------------------------------------------
 
@@ -45,6 +49,12 @@ def fliege_zur_station():
 
 # ---- WebSocket-Client zum Comm-Modul --------------------------------------
 
+ws_app = None
+verbunden = threading.Event()      # Fix: zeigt an, ob die WS-Verbindung wirklich offen ist
+soll_laufen = threading.Event()    # steuert sauberes Beenden/Reconnect
+soll_laufen.set()
+
+
 def on_message(ws, message):
     print("Comm-Modul -> wir:", message)
     try:
@@ -54,6 +64,7 @@ def on_message(ws, message):
 
 
 def on_open(ws):
+    verbunden.set()
     print(f"Mit Comm-Modul von {STATION_NAME} verbunden.")
 
 
@@ -62,12 +73,12 @@ def on_error(ws, error):
 
 
 def on_close(ws, code, msg):
-    print("WebSocket geschlossen, versuche Reconnect in 3s...")
-    time.sleep(3)
-    starte_ws()
-
-
-ws_app = None
+    verbunden.clear()
+    print("WebSocket geschlossen.")
+    if soll_laufen.is_set():
+        print(f"Versuche Reconnect in {RECONNECT_SEKUNDEN}s...")
+        time.sleep(RECONNECT_SEKUNDEN)
+        starte_ws()
 
 
 def starte_ws():
@@ -83,7 +94,10 @@ def starte_ws():
 
 
 def sende_an_comm_modul(payload):
-    if ws_app is None:
+    # Fix: nicht nur prüfen ob ws_app existiert, sondern ob die Verbindung
+    # auch wirklich offen ist (verbunden-Flag) - vermeidet Crash beim
+    # allerersten Heartbeat, bevor on_open gefeuert hat.
+    if ws_app is None or not verbunden.is_set():
         return
     try:
         ws_app.send(json.dumps(payload))
@@ -107,7 +121,12 @@ def relay_empfangen():
 
 def starte_rest_server():
     threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=EIGENER_PORT, use_reloader=False),
+        target=lambda: app.run(
+            host="0.0.0.0",
+            port=EIGENER_PORT,
+            use_reloader=False,
+            threaded=True,   # Fix: gleichzeitige Requests blockieren sich sonst
+        ),
         daemon=True,
     ).start()
 
@@ -148,9 +167,13 @@ def heartbeat():
 
 if __name__ == "__main__":
     fliege_zur_station()
-    time.sleep(7)  # warten, bis Schiff angekommen ist
 
     starte_ws()
+    # Fix: statt blind 7s zu warten, auf das verbunden-Flag warten (mit Timeout
+    # als Fallback, falls das Schiff/Backend doch länger braucht).
+    if not verbunden.wait(timeout=15):
+        print("Warnung: WebSocket nach 15s noch nicht verbunden, mache trotzdem weiter...")
+
     starte_rest_server()
 
     threading.Thread(target=weiterleiten_an_partner, daemon=True).start()
@@ -158,5 +181,9 @@ if __name__ == "__main__":
     threading.Thread(target=heartbeat, daemon=True).start()
 
     print("Kommunikation läuft... (Ctrl+C zum Beenden)")
-    while True:
-        time.sleep(1)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        soll_laufen.clear()
+        print("Beende...")
