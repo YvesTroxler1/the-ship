@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Aufgabe: Scanner via Message Queue (RabbitMQ) nutzen, um G-Station 1-2
-zu finden und 60s lang in ihrer Nähe zu bleiben.
+Aufgabe 3: Scanner via Message Queue (RabbitMQ) nutzen, um G-Station 1-2
+zu finden und 60s lang in ihrer Naehe zu bleiben.
+
+Voraussetzung: Der Broker laeuft auf dem Schiff unter 192.168.101.20:2014
+(siehe rabbitmq.yaml im gleichen Ordner). Erst dann publiziert das
+Scanner-Modul in den Fanout-Exchange 'scanner/detected_objects'.
 """
 
 import json
@@ -11,55 +15,75 @@ import time
 import pika
 import requests
 
-RABBIT_HOST = "192.168.101.21"
+SCHIFF = "192.168.101.20"
+
+RABBIT_HOST = SCHIFF
 RABBIT_PORT = 2014
+EXCHANGE = "scanner/detected_objects"
 
-BASE = "http://192.168.101.21"
+STEUERUNG_URL = f"http://{SCHIFF}:2009/set_target"   # easy steering
+POSITION_URL = f"http://{SCHIFF}:2010/pos"           # navigation
+
 STATION_NAME = "G-Station 1-2"
+# Laut WhatsUpp-Auftrag kommt die Station regelmaessig hier vorbei.
+TREFFPUNKT = {"x": 11382, "y": 15255}
 
-# Letzte bekannte Position der gesuchten Station (wird vom Scanner-Thread aktualisiert)
-letzte_position = None
+NAEHE_RADIUS = 100      # ab dieser Distanz zaehlen wir als "in der Naehe"
+ZIEL_NACHFUEHRUNG = 20  # Kurs erst neu setzen, wenn sich das Ziel so weit bewegt hat
+SICHTUNG_GUELTIG = 15   # Sekunden, die eine Sichtung als aktuell gilt
+VORHALTEZEIT = 4        # Sekunden, die wir der Station vorhalten (sie bewegt sich)
+TAKT = 0.5              # Sekunden zwischen zwei Regelschritten
+
+# Wird vom Scanner-Thread geschrieben, von main() gelesen.
+sichtung = None         # (position, zeitstempel)
+vorherige_sichtung = None
 lock = threading.Lock()
 
 
 def scanner_thread():
     """Lauscht dauerhaft auf die Scanner-Nachrichten und merkt sich die Position
     von G-Station 1-2, sobald sie erkannt wird."""
-    global letzte_position
+    global sichtung, vorherige_sichtung
 
     while True:
         try:
-            connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=RABBIT_HOST, port=RABBIT_PORT)
+            verbindung = pika.BlockingConnection(
+                pika.ConnectionParameters(
+                    host=RABBIT_HOST, port=RABBIT_PORT, heartbeat=30
+                )
             )
-            channel = connection.channel()
+            channel = verbindung.channel()
 
-            channel.exchange_declare(exchange="scanner/detected_objects", exchange_type="fanout")
-            result = channel.queue_declare(queue="", exclusive=True)
-            queue_name = result.method.queue
-            channel.queue_bind(exchange="scanner/detected_objects", queue=queue_name)
+            channel.exchange_declare(exchange=EXCHANGE, exchange_type="fanout")
+            queue_name = channel.queue_declare(queue="", exclusive=True).method.queue
+            channel.queue_bind(exchange=EXCHANGE, queue=queue_name)
 
             print("Mit Scanner-Queue verbunden, warte auf Objekte...")
 
-            for method_frame, properties, body in channel.consume(queue=queue_name, auto_ack=True):
+            for method_frame, properties, body in channel.consume(
+                queue=queue_name, auto_ack=True
+            ):
                 objekte = json.loads(body.decode("utf-8"))
-                for obj in objekte:
-                    if obj.get("name") == STATION_NAME:
+                for objekt in objekte:
+                    if objekt.get("name") == STATION_NAME:
                         with lock:
-                            letzte_position = obj["pos"]
-                        print(f"{STATION_NAME} gesichtet bei {obj['pos']}")
+                            vorherige_sichtung = sichtung
+                            sichtung = (objekt["pos"], time.time())
 
-        except pika.exceptions.AMQPConnectionError as e:
-            print("RabbitMQ-Verbindung verloren/fehlgeschlagen, versuche erneut in 3s:", e)
+        except (pika.exceptions.AMQPError, OSError) as fehler:
+            print("RabbitMQ-Verbindung fehlgeschlagen, neuer Versuch in 3s:", fehler)
             time.sleep(3)
 
 
 def fliege_zu(x, y):
-    requests.post(f"{BASE}:2009/set_target", json={"target": {"x": x, "y": y}}).raise_for_status()
+    antwort = requests.post(
+        STEUERUNG_URL, json={"target": {"x": x, "y": y}}, timeout=5
+    )
+    antwort.raise_for_status()
 
 
 def hole_position():
-    antwort = requests.get(f"{BASE}:2011/pos")
+    antwort = requests.get(POSITION_URL, timeout=5)
     antwort.raise_for_status()
     return antwort.json()["pos"]
 
@@ -68,46 +92,92 @@ def distanz(a, b):
     return ((a["x"] - b["x"]) ** 2 + (a["y"] - b["y"]) ** 2) ** 0.5
 
 
-NAEHE_RADIUS = 500  # anpassen, je nachdem wie "in der Nähe" im Spiel definiert ist
+def vorhalten(neu, alt, sekunden):
+    """Die Station bewegt sich. Wenn wir immer nur ihre gemeldete Position
+    ansteuern, hinken wir dauerhaft hinterher. Darum aus den letzten beiden
+    Sichtungen die Geschwindigkeit schaetzen und ein Stueck vorhalten."""
+    if alt is None:
+        return neu[0]
+
+    (position, jetzt), (alte_position, vorher) = neu, alt
+    dt = jetzt - vorher
+    if dt <= 0:
+        return position
+
+    return {
+        "x": position["x"] + (position["x"] - alte_position["x"]) / dt * sekunden,
+        "y": position["y"] + (position["y"] - alte_position["y"]) / dt * sekunden,
+    }
 
 
 def main():
     threading.Thread(target=scanner_thread, daemon=True).start()
 
-    letztes_ziel = None
-    zeit_in_naehe_start = None
+    # Ohne Sichtung erst mal zum bekannten Treffpunkt fliegen - der Scanner
+    # sieht die Station nur, wenn wir nah genug dran sind.
+    print(f"Kurs auf den Treffpunkt {TREFFPUNKT}, warte auf {STATION_NAME}...")
+    fliege_zu(TREFFPUNKT["x"], TREFFPUNKT["y"])
 
-    print("Warte auf erste Sichtung von G-Station 1-2...")
+    letztes_ziel = TREFFPUNKT
+    naehe_seit = None
+    gemeldet = False
 
     while True:
         with lock:
-            ziel = letzte_position
+            aktuelle_sichtung = sichtung
+            letzte_sichtung = vorherige_sichtung
 
-        if ziel is not None:
-            # Ziel nur neu setzen, wenn es sich merklich geändert hat
-            if ziel != letztes_ziel:
-                fliege_zu(ziel["x"], ziel["y"])
-                letztes_ziel = ziel
-                print(f"Kurs korrigiert auf {ziel}")
+        if aktuelle_sichtung is None:
+            print("Noch keine Sichtung, fliege weiter zum Treffpunkt.")
+            time.sleep(2)
+            continue
 
-            eigene_pos = hole_position()
-            d = distanz(eigene_pos, ziel)
+        ziel, gesehen_um = aktuelle_sichtung
+        alter = time.time() - gesehen_um
 
-            if d <= NAEHE_RADIUS:
-                if zeit_in_naehe_start is None:
-                    zeit_in_naehe_start = time.time()
-                vergangen = time.time() - zeit_in_naehe_start
-                print(f"In Nähe der Station: {vergangen:.1f}s / 60s (Distanz {d:.0f})")
-                if vergangen >= 60:
-                    print("Aufgabe erfüllt: 60s in der Nähe von G-Station 1-2!")
-                    break
-            else:
-                if zeit_in_naehe_start is not None:
-                    print("Aus der Nähe gefallen, Timer zurückgesetzt.")
-                zeit_in_naehe_start = None
+        if alter > SICHTUNG_GUELTIG:
+            # Station ist aus der Scanner-Reichweite verschwunden: zurueck zum
+            # Treffpunkt, dort taucht sie wieder auf.
+            print(f"Sichtung ist {alter:.0f}s alt - zurueck zum Treffpunkt.")
+            if distanz(letztes_ziel, TREFFPUNKT) > ZIEL_NACHFUEHRUNG:
+                fliege_zu(TREFFPUNKT["x"], TREFFPUNKT["y"])
+                letztes_ziel = TREFFPUNKT
+            naehe_seit = None
+            time.sleep(2)
+            continue
 
-        time.sleep(2)
+        # Kurs nur korrigieren, wenn sich der Vorhaltepunkt merklich bewegt hat.
+        anflugpunkt = vorhalten(aktuelle_sichtung, letzte_sichtung, VORHALTEZEIT)
+        if distanz(anflugpunkt, letztes_ziel) > ZIEL_NACHFUEHRUNG:
+            fliege_zu(anflugpunkt["x"], anflugpunkt["y"])
+            letztes_ziel = anflugpunkt
+
+        eigene_position = hole_position()
+        abstand = distanz(eigene_position, ziel)
+
+        if abstand <= NAEHE_RADIUS:
+            if naehe_seit is None:
+                naehe_seit = time.time()
+            dauer = time.time() - naehe_seit
+            print(f"In der Naehe: {dauer:.0f}s / 60s (Distanz {abstand:.0f})")
+            if dauer >= 60 and not gemeldet:
+                print(
+                    "60s in der Naehe von G-Station 1-2 geschafft. "
+                    "Fortschritt im Cockpit (WhatsUpp-Widget) pruefen - "
+                    "Ctrl+C zum Beenden."
+                )
+                gemeldet = True
+        else:
+            if naehe_seit is not None:
+                print(f"Abstand wieder zu gross ({abstand:.0f}), Timer zurueckgesetzt.")
+            naehe_seit = None
+            gemeldet = False
+
+        time.sleep(TAKT)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nBeendet.")
